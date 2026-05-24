@@ -145,8 +145,30 @@ func (n *Node) becomeLeader() {
 		n.nextIndex[peer] = n.lastLogIndex() + 1
 		n.matchIndex[peer] = 0
 	}
-	n.broadcastHeartbeat()
+	n.matchIndex[n.id] = n.lastLogIndex()
+	n.broadcastAppendEntries()
 	go n.heartbeatTicker()
+}
+
+func (n *Node) Submit(command []byte) (index int, term int, isLeader bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.role != Leader {
+		return -1, n.currentTerm, false
+	}
+
+	entry := LogEntry{
+		Term:    n.currentTerm,
+		Index:   n.lastLogIndex() + 1,
+		Command: command,
+	}
+	n.log = append(n.log, entry)
+	n.storage.AppendLogs([]LogEntry{entry})
+	n.matchIndex[n.id] = entry.Index
+	n.broadcastAppendEntries()
+
+	return entry.Index, n.currentTerm, true
 }
 
 // --- Election ---
@@ -203,7 +225,7 @@ func (n *Node) isLogUpToDate(lastIndex, lastTerm int) bool {
 	return lastIndex >= n.lastLogIndex()
 }
 
-// --- Heartbeats ---
+// --- Replication ---
 
 func (n *Node) heartbeatTicker() {
 	ticker := time.NewTicker(HeartbeatInterval)
@@ -218,42 +240,123 @@ func (n *Node) heartbeatTicker() {
 				n.mu.Unlock()
 				return
 			}
-			n.broadcastHeartbeat()
+			n.broadcastAppendEntries()
 			n.mu.Unlock()
 		}
 	}
 }
 
-func (n *Node) broadcastHeartbeat() {
+func (n *Node) broadcastAppendEntries() {
 	for _, peer := range n.peers {
-		go func(peer NodeID) {
-			n.mu.Lock()
-			args := AppendEntriesArgs{
-				Term:         n.currentTerm,
-				LeaderID:     n.id,
-				PrevLogIndex: n.lastLogIndex(),
-				PrevLogTerm:  n.lastLogTerm(),
-				Entries:      nil,
-				LeaderCommit: n.commitIndex,
-			}
-			term := n.currentTerm
-			n.mu.Unlock()
+		go n.sendAppendEntries(peer)
+	}
+}
 
-			reply, err := n.transport.SendAppendEntries(peer, args)
-			if err != nil {
-				return
-			}
+func (n *Node) sendAppendEntries(peer NodeID) {
+	n.mu.Lock()
+	if n.role != Leader {
+		n.mu.Unlock()
+		return
+	}
 
-			n.mu.Lock()
-			defer n.mu.Unlock()
+	next := n.nextIndex[peer]
+	prevLogIndex := next - 1
+	prevLogTerm := 0
+	if prevLogIndex > 0 && prevLogIndex < len(n.log) {
+		prevLogTerm = n.log[prevLogIndex].Term
+	}
 
-			if n.currentTerm != term || n.role != Leader {
-				return
+	var entries []LogEntry
+	if next <= n.lastLogIndex() {
+		entries = make([]LogEntry, len(n.log[next:]))
+		copy(entries, n.log[next:])
+	}
+
+	args := AppendEntriesArgs{
+		Term:         n.currentTerm,
+		LeaderID:     n.id,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: n.commitIndex,
+	}
+	term := n.currentTerm
+	n.mu.Unlock()
+
+	reply, err := n.transport.SendAppendEntries(peer, args)
+	if err != nil {
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.currentTerm != term || n.role != Leader {
+		return
+	}
+	if reply.Term > n.currentTerm {
+		n.becomeFollower(reply.Term)
+		return
+	}
+
+	if reply.Success {
+		match := prevLogIndex + len(entries)
+		if match > n.matchIndex[peer] {
+			n.matchIndex[peer] = match
+		}
+		n.nextIndex[peer] = match + 1
+		n.advanceCommitIndex()
+	} else {
+		if reply.ConflictTerm > 0 {
+			lastOfTerm := -1
+			for i := n.lastLogIndex(); i >= 1; i-- {
+				if n.log[i].Term == reply.ConflictTerm {
+					lastOfTerm = i
+					break
+				}
 			}
-			if reply.Term > n.currentTerm {
-				n.becomeFollower(reply.Term)
+			if lastOfTerm > 0 {
+				n.nextIndex[peer] = lastOfTerm + 1
+			} else {
+				n.nextIndex[peer] = reply.ConflictIndex
 			}
-		}(peer)
+		} else if reply.ConflictIndex > 0 {
+			n.nextIndex[peer] = reply.ConflictIndex
+		} else {
+			n.nextIndex[peer]--
+		}
+		if n.nextIndex[peer] < 1 {
+			n.nextIndex[peer] = 1
+		}
+	}
+}
+
+// Only commit entries from the leader's current term
+func (n *Node) advanceCommitIndex() {
+	for idx := n.commitIndex + 1; idx <= n.lastLogIndex(); idx++ {
+		if n.log[idx].Term != n.currentTerm {
+			continue
+		}
+		count := 1
+		for _, peer := range n.peers {
+			if n.matchIndex[peer] >= idx {
+				count++
+			}
+		}
+		if count > (len(n.peers)+1)/2 {
+			n.commitIndex = idx
+		}
+	}
+	n.applyCommitted()
+}
+
+func (n *Node) applyCommitted() {
+	for n.lastApplied < n.commitIndex {
+		n.lastApplied++
+		n.applyCh <- ApplyMsg{
+			Command:      n.log[n.lastApplied].Command,
+			CommandIndex: n.lastApplied,
+		}
 	}
 }
 
@@ -300,7 +403,50 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	}
 	n.resetElectionTimer()
 	reply.Term = n.currentTerm
-	reply.Success = true
 
+	if args.PrevLogIndex > 0 {
+		if args.PrevLogIndex > n.lastLogIndex() {
+			reply.ConflictIndex = n.lastLogIndex() + 1
+			return reply
+		}
+		if n.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			reply.ConflictTerm = n.log[args.PrevLogIndex].Term
+			idx := args.PrevLogIndex
+			for idx > 1 && n.log[idx-1].Term == reply.ConflictTerm {
+				idx--
+			}
+			reply.ConflictIndex = idx
+			return reply
+		}
+	}
+
+	for i, entry := range args.Entries {
+		insertIdx := args.PrevLogIndex + 1 + i
+		if insertIdx <= n.lastLogIndex() {
+			if n.log[insertIdx].Term != entry.Term {
+				n.log = n.log[:insertIdx]
+				n.storage.TruncateFrom(insertIdx)
+				n.log = append(n.log, args.Entries[i:]...)
+				n.storage.AppendLogs(args.Entries[i:])
+				break
+			}
+		} else {
+			n.log = append(n.log, args.Entries[i:]...)
+			n.storage.AppendLogs(args.Entries[i:])
+			break
+		}
+	}
+
+	if args.LeaderCommit > n.commitIndex {
+		lastNewEntry := args.PrevLogIndex + len(args.Entries)
+		if args.LeaderCommit < lastNewEntry {
+			n.commitIndex = args.LeaderCommit
+		} else {
+			n.commitIndex = lastNewEntry
+		}
+		n.applyCommitted()
+	}
+
+	reply.Success = true
 	return reply
 }
