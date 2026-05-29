@@ -37,6 +37,7 @@ type Node struct {
 	transport      Transport
 	storage        Storage
 	applyCh        chan ApplyMsg
+	applyCond      *sync.Cond
 	rng            *rand.Rand
 	electionTimer  *time.Timer
 	dead           int32
@@ -44,7 +45,7 @@ type Node struct {
 }
 
 func NewNode(id NodeID, peers []NodeID, transport Transport, storage Storage, applyCh chan ApplyMsg, seed int64) *Node {
-	return &Node{
+	n := &Node{
 		id:         id,
 		peers:      peers,
 		votedFor:   NullVote,
@@ -58,16 +59,36 @@ func NewNode(id NodeID, peers []NodeID, transport Transport, storage Storage, ap
 		rng:        rand.New(rand.NewSource(seed)),
 		stopCh:     make(chan struct{}),
 	}
+	n.applyCond = sync.NewCond(&n.mu)
+	return n
 }
 
 func (n *Node) Start() {
+	n.restoreFromStorage()
 	n.resetElectionTimer()
 	go n.electionTicker()
+	go n.applier()
+}
+
+func (n *Node) restoreFromStorage() {
+	term, votedFor, err := n.storage.GetState()
+	if err == nil {
+		n.currentTerm = term
+		n.votedFor = votedFor
+	}
+	lastIdx, err := n.storage.LastIndex()
+	if err == nil && lastIdx > 0 {
+		entries, err := n.storage.GetLogRange(1, lastIdx)
+		if err == nil {
+			n.log = append(n.log[:1], entries...)
+		}
+	}
 }
 
 func (n *Node) Stop() {
 	atomic.StoreInt32(&n.dead, 1)
 	close(n.stopCh)
+	n.applyCond.Broadcast()
 }
 
 func (n *Node) killed() bool {
@@ -145,7 +166,16 @@ func (n *Node) becomeLeader() {
 		n.nextIndex[peer] = n.lastLogIndex() + 1
 		n.matchIndex[peer] = 0
 	}
-	n.matchIndex[n.id] = n.lastLogIndex()
+
+	noop := LogEntry{
+		Term:    n.currentTerm,
+		Index:   n.lastLogIndex() + 1,
+		Command: nil,
+	}
+	n.log = append(n.log, noop)
+	n.storage.AppendLogs([]LogEntry{noop})
+	n.matchIndex[n.id] = noop.Index
+
 	n.broadcastAppendEntries()
 	go n.heartbeatTicker()
 }
@@ -347,15 +377,32 @@ func (n *Node) advanceCommitIndex() {
 			n.commitIndex = idx
 		}
 	}
-	n.applyCommitted()
+	n.signalApply()
 }
 
-func (n *Node) applyCommitted() {
-	for n.lastApplied < n.commitIndex {
-		n.lastApplied++
-		n.applyCh <- ApplyMsg{
-			Command:      n.log[n.lastApplied].Command,
-			CommandIndex: n.lastApplied,
+func (n *Node) signalApply() {
+	n.applyCond.Signal()
+}
+
+func (n *Node) applier() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for {
+		for n.lastApplied >= n.commitIndex && !n.killed() {
+			n.applyCond.Wait()
+		}
+		if n.killed() {
+			return
+		}
+		for n.lastApplied < n.commitIndex {
+			n.lastApplied++
+			msg := ApplyMsg{
+				Command:      n.log[n.lastApplied].Command,
+				CommandIndex: n.lastApplied,
+			}
+			n.mu.Unlock()
+			n.applyCh <- msg
+			n.mu.Lock()
 		}
 	}
 }
@@ -438,13 +485,14 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	}
 
 	if args.LeaderCommit > n.commitIndex {
-		lastNewEntry := args.PrevLogIndex + len(args.Entries)
-		if args.LeaderCommit < lastNewEntry {
-			n.commitIndex = args.LeaderCommit
-		} else {
-			n.commitIndex = lastNewEntry
+		newCommit := args.LeaderCommit
+		if n.lastLogIndex() < newCommit {
+			newCommit = n.lastLogIndex()
 		}
-		n.applyCommitted()
+		if newCommit > n.commitIndex {
+			n.commitIndex = newCommit
+			n.signalApply()
+		}
 	}
 
 	reply.Success = true
