@@ -10,6 +10,7 @@ import (
 type FaultConfig struct {
 	DropRate      float64
 	DuplicateRate float64
+	ReorderRate   float64
 	MinDelay      time.Duration
 	MaxDelay      time.Duration
 }
@@ -75,6 +76,22 @@ func (st *SimTransport) shouldDuplicate() bool {
 	return st.rng.Float64() < st.faults.DuplicateRate
 }
 
+// A reordered message is held an extra MaxDelay so later messages overtake it.
+func (st *SimTransport) shouldReorder() bool {
+	return st.rng.Float64() < st.faults.ReorderRate
+}
+
+// Resolved at delivery time so crashed nodes never process messages still in flight.
+func (st *SimTransport) liveNode(id NodeID) *Node {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	node := st.nodes[id]
+	if node == nil || node.killed() {
+		return nil
+	}
+	return node
+}
+
 func (st *SimTransport) randomDelay() time.Duration {
 	if st.faults.MaxDelay <= st.faults.MinDelay {
 		return st.faults.MinDelay
@@ -85,27 +102,32 @@ func (st *SimTransport) randomDelay() time.Duration {
 
 func (st *SimTransport) SendRequestVote(target NodeID, args RequestVoteArgs) (RequestVoteReply, error) {
 	st.mu.Lock()
-	node, ok := st.nodes[target]
 	partitioned := st.isPartitioned(args.CandidateID, target)
 	drop := st.shouldDrop()
 	dup := st.shouldDuplicate()
 	delay := st.randomDelay()
+	if st.shouldReorder() {
+		delay += st.faults.MaxDelay
+	}
 	st.mu.Unlock()
 
-	if !ok {
-		return RequestVoteReply{}, fmt.Errorf("node %d not found", target)
-	}
 	if partitioned || drop {
 		return RequestVoteReply{}, fmt.Errorf("message dropped")
 	}
 
 	time.Sleep(delay)
+	node := st.liveNode(target)
+	if node == nil {
+		return RequestVoteReply{}, fmt.Errorf("node %d down", target)
+	}
 	reply := node.HandleRequestVote(args)
 
 	if dup {
 		go func() {
 			time.Sleep(delay)
-			node.HandleRequestVote(args)
+			if node := st.liveNode(target); node != nil {
+				node.HandleRequestVote(args)
+			}
 		}()
 	}
 
@@ -114,27 +136,32 @@ func (st *SimTransport) SendRequestVote(target NodeID, args RequestVoteArgs) (Re
 
 func (st *SimTransport) SendAppendEntries(target NodeID, args AppendEntriesArgs) (AppendEntriesReply, error) {
 	st.mu.Lock()
-	node, ok := st.nodes[target]
 	partitioned := st.isPartitioned(args.LeaderID, target)
 	drop := st.shouldDrop()
 	dup := st.shouldDuplicate()
 	delay := st.randomDelay()
+	if st.shouldReorder() {
+		delay += st.faults.MaxDelay
+	}
 	st.mu.Unlock()
 
-	if !ok {
-		return AppendEntriesReply{}, fmt.Errorf("node %d not found", target)
-	}
 	if partitioned || drop {
 		return AppendEntriesReply{}, fmt.Errorf("message dropped")
 	}
 
 	time.Sleep(delay)
+	node := st.liveNode(target)
+	if node == nil {
+		return AppendEntriesReply{}, fmt.Errorf("node %d down", target)
+	}
 	reply := node.HandleAppendEntries(args)
 
 	if dup {
 		go func() {
 			time.Sleep(delay)
-			node.HandleAppendEntries(args)
+			if node := st.liveNode(target); node != nil {
+				node.HandleAppendEntries(args)
+			}
 		}()
 	}
 
@@ -143,21 +170,19 @@ func (st *SimTransport) SendAppendEntries(target NodeID, args AppendEntriesArgs)
 
 func (st *SimTransport) SendInstallSnapshot(target NodeID, args InstallSnapshotArgs) (InstallSnapshotReply, error) {
 	st.mu.Lock()
-	node, ok := st.nodes[target]
 	partitioned := st.isPartitioned(args.LeaderID, target)
 	drop := st.shouldDrop()
 	delay := st.randomDelay()
 	st.mu.Unlock()
 
-	if !ok {
-		return InstallSnapshotReply{}, fmt.Errorf("node %d not found", target)
-	}
 	if partitioned || drop {
 		return InstallSnapshotReply{}, fmt.Errorf("message dropped")
 	}
 
 	time.Sleep(delay)
-	// Stub — InstallSnapshot handler not yet implemented
-	_ = node
+	if st.liveNode(target) == nil {
+		return InstallSnapshotReply{}, fmt.Errorf("node %d down", target)
+	}
+	// InstallSnapshot handler not yet implemented
 	return InstallSnapshotReply{}, fmt.Errorf("not implemented")
 }

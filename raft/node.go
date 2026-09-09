@@ -64,31 +64,44 @@ func NewNode(id NodeID, peers []NodeID, transport Transport, storage Storage, ap
 }
 
 func (n *Node) Start() {
+	n.mu.Lock()
 	n.restoreFromStorage()
 	n.resetElectionTimer()
+	n.mu.Unlock()
 	go n.electionTicker()
 	go n.applier()
 }
 
+// A node that cannot read its persisted state must not start with amnesia (fail-stop).
 func (n *Node) restoreFromStorage() {
 	term, votedFor, err := n.storage.GetState()
-	if err == nil {
-		n.currentTerm = term
-		n.votedFor = votedFor
+	if err != nil {
+		panic(err)
 	}
+	n.currentTerm = term
+	n.votedFor = votedFor
+
 	lastIdx, err := n.storage.LastIndex()
-	if err == nil && lastIdx > 0 {
+	if err != nil {
+		panic(err)
+	}
+	if lastIdx > 0 {
 		entries, err := n.storage.GetLogRange(1, lastIdx)
-		if err == nil {
-			n.log = append(n.log[:1], entries...)
+		if err != nil {
+			panic(err)
 		}
+		n.log = append(n.log[:1], entries...)
 	}
 }
 
 func (n *Node) Stop() {
-	atomic.StoreInt32(&n.dead, 1)
+	if !atomic.CompareAndSwapInt32(&n.dead, 0, 1) {
+		return
+	}
 	close(n.stopCh)
+	n.mu.Lock()
 	n.applyCond.Broadcast()
+	n.mu.Unlock()
 }
 
 func (n *Node) killed() bool {
@@ -149,7 +162,21 @@ func (n *Node) electionTicker() {
 }
 
 func (n *Node) persist() {
-	n.storage.SetState(n.currentTerm, n.votedFor)
+	if err := n.storage.SetState(n.currentTerm, n.votedFor); err != nil {
+		panic(err)
+	}
+}
+
+func (n *Node) appendToStorage(entries []LogEntry) {
+	if err := n.storage.AppendLogs(entries); err != nil {
+		panic(err)
+	}
+}
+
+func (n *Node) truncateStorage(index int) {
+	if err := n.storage.TruncateFrom(index); err != nil {
+		panic(err)
+	}
 }
 
 func (n *Node) becomeFollower(term int) {
@@ -173,7 +200,7 @@ func (n *Node) becomeLeader() {
 		Command: nil,
 	}
 	n.log = append(n.log, noop)
-	n.storage.AppendLogs([]LogEntry{noop})
+	n.appendToStorage([]LogEntry{noop})
 	n.matchIndex[n.id] = noop.Index
 
 	n.broadcastAppendEntries()
@@ -194,14 +221,12 @@ func (n *Node) Submit(command []byte) (index int, term int, isLeader bool) {
 		Command: command,
 	}
 	n.log = append(n.log, entry)
-	n.storage.AppendLogs([]LogEntry{entry})
+	n.appendToStorage([]LogEntry{entry})
 	n.matchIndex[n.id] = entry.Index
 	n.broadcastAppendEntries()
 
 	return entry.Index, n.currentTerm, true
 }
-
-// --- Election ---
 
 func (n *Node) startElection() {
 	n.currentTerm++
@@ -230,7 +255,7 @@ func (n *Node) startElection() {
 			n.mu.Lock()
 			defer n.mu.Unlock()
 
-			if n.currentTerm != term || n.role != Candidate {
+			if n.killed() || n.currentTerm != term || n.role != Candidate {
 				return
 			}
 			if reply.Term > n.currentTerm {
@@ -254,8 +279,6 @@ func (n *Node) isLogUpToDate(lastIndex, lastTerm int) bool {
 	}
 	return lastIndex >= n.lastLogIndex()
 }
-
-// --- Replication ---
 
 func (n *Node) heartbeatTicker() {
 	ticker := time.NewTicker(HeartbeatInterval)
@@ -284,7 +307,7 @@ func (n *Node) broadcastAppendEntries() {
 
 func (n *Node) sendAppendEntries(peer NodeID) {
 	n.mu.Lock()
-	if n.role != Leader {
+	if n.killed() || n.role != Leader {
 		n.mu.Unlock()
 		return
 	}
@@ -321,7 +344,7 @@ func (n *Node) sendAppendEntries(peer NodeID) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	if n.currentTerm != term || n.role != Leader {
+	if n.killed() || n.currentTerm != term || n.role != Leader {
 		return
 	}
 	if reply.Term > n.currentTerm {
@@ -401,13 +424,16 @@ func (n *Node) applier() {
 				CommandIndex: n.lastApplied,
 			}
 			n.mu.Unlock()
-			n.applyCh <- msg
+			select {
+			case n.applyCh <- msg:
+			case <-n.stopCh:
+				n.mu.Lock()
+				return
+			}
 			n.mu.Lock()
 		}
 	}
 }
-
-// --- RPC Handlers ---
 
 func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	n.mu.Lock()
@@ -472,14 +498,14 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		if insertIdx <= n.lastLogIndex() {
 			if n.log[insertIdx].Term != entry.Term {
 				n.log = n.log[:insertIdx]
-				n.storage.TruncateFrom(insertIdx)
+				n.truncateStorage(insertIdx)
 				n.log = append(n.log, args.Entries[i:]...)
-				n.storage.AppendLogs(args.Entries[i:])
+				n.appendToStorage(args.Entries[i:])
 				break
 			}
 		} else {
 			n.log = append(n.log, args.Entries[i:]...)
-			n.storage.AppendLogs(args.Entries[i:])
+			n.appendToStorage(args.Entries[i:])
 			break
 		}
 	}

@@ -3,11 +3,13 @@ package raft
 import "time"
 
 type Cluster struct {
-	Nodes     []*Node
+	Nodes      []*Node
 	ApplyChans []chan ApplyMsg
-	Storage   []*MemStorage
-	Transport *SimTransport
-	size      int
+	Storage    []*MemStorage
+	Transport  *SimTransport
+	size       int
+	seed       int64
+	restarts   []int
 }
 
 func NewCluster(size int, seed int64, faults FaultConfig) *Cluster {
@@ -36,6 +38,8 @@ func NewCluster(size int, seed int64, faults FaultConfig) *Cluster {
 		Storage:    storage,
 		Transport:  transport,
 		size:       size,
+		seed:       seed,
+		restarts:   make([]int, size),
 	}
 }
 
@@ -53,6 +57,9 @@ func (c *Cluster) Stop() {
 
 func (c *Cluster) Leader() *Node {
 	for _, node := range c.Nodes {
+		if node.killed() {
+			continue
+		}
 		_, role := node.GetState()
 		if role == Leader {
 			return node
@@ -78,15 +85,13 @@ func (c *Cluster) CrashNode(id NodeID) {
 
 func (c *Cluster) RestartNode(id NodeID) {
 	old := c.Nodes[id]
-	ch := c.ApplyChans[id]
+	ch := make(chan ApplyMsg, 100)
+	c.ApplyChans[id] = ch
 
-	// Drain the apply channel
-	for len(ch) > 0 {
-		<-ch
-	}
-
-	node := NewNode(old.id, old.peers, c.Transport, c.Storage[id], ch, int64(id)+time.Now().UnixNano())
+	c.restarts[id]++
+	seed := c.seed + int64(id) + int64(c.size)*int64(c.restarts[id])
+	node := NewNode(old.id, old.peers, c.Transport, c.Storage[id], ch, seed)
 	c.Nodes[id] = node
-	c.Transport.RegisterNode(id, node)
 	node.Start()
+	c.Transport.RegisterNode(id, node)
 }
