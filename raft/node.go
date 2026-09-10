@@ -10,6 +10,7 @@ import (
 const (
 	ElectionTimeoutMin = 150 * time.Millisecond
 	ElectionTimeoutMax = 300 * time.Millisecond
+	ElectionTick       = 10 * time.Millisecond
 	HeartbeatInterval  = 50 * time.Millisecond
 )
 
@@ -34,14 +35,14 @@ type Node struct {
 	nextIndex  map[NodeID]int
 	matchIndex map[NodeID]int
 
-	transport      Transport
-	storage        Storage
-	applyCh        chan ApplyMsg
-	applyCond      *sync.Cond
-	rng            *rand.Rand
-	electionTimer  *time.Timer
-	dead           int32
-	stopCh         chan struct{}
+	transport        Transport
+	storage          Storage
+	applyCh          chan ApplyMsg
+	applyCond        *sync.Cond
+	rng              *rand.Rand
+	electionDeadline time.Time
+	dead             int32
+	stopCh           chan struct{}
 }
 
 func NewNode(id NodeID, peers []NodeID, transport Transport, storage Storage, applyCh chan ApplyMsg, seed int64) *Node {
@@ -132,32 +133,18 @@ func (n *Node) randomElectionTimeout() time.Duration {
 }
 
 func (n *Node) resetElectionTimer() {
-	if n.electionTimer == nil {
-		n.electionTimer = time.NewTimer(n.randomElectionTimeout())
-	} else {
-		if !n.electionTimer.Stop() {
-			select {
-			case <-n.electionTimer.C:
-			default:
-			}
-		}
-		n.electionTimer.Reset(n.randomElectionTimeout())
-	}
+	n.electionDeadline = time.Now().Add(n.randomElectionTimeout())
 }
 
 func (n *Node) electionTicker() {
-	for {
-		select {
-		case <-n.stopCh:
-			return
-		case <-n.electionTimer.C:
-			n.mu.Lock()
-			if n.role != Leader {
-				n.startElection()
-			}
+	for !n.killed() {
+		time.Sleep(ElectionTick)
+		n.mu.Lock()
+		if !n.killed() && n.role != Leader && time.Now().After(n.electionDeadline) {
+			n.startElection()
 			n.resetElectionTimer()
-			n.mu.Unlock()
 		}
+		n.mu.Unlock()
 	}
 }
 
@@ -211,7 +198,7 @@ func (n *Node) Submit(command []byte) (index int, term int, isLeader bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	if n.role != Leader {
+	if n.killed() || n.role != Leader {
 		return -1, n.currentTerm, false
 	}
 
@@ -410,28 +397,22 @@ func (n *Node) signalApply() {
 func (n *Node) applier() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	for {
-		for n.lastApplied >= n.commitIndex && !n.killed() {
+	for !n.killed() {
+		if n.lastApplied >= n.commitIndex {
 			n.applyCond.Wait()
+			continue
 		}
-		if n.killed() {
-			return
+		n.lastApplied++
+		msg := ApplyMsg{
+			Command:      n.log[n.lastApplied].Command,
+			CommandIndex: n.lastApplied,
 		}
-		for n.lastApplied < n.commitIndex {
-			n.lastApplied++
-			msg := ApplyMsg{
-				Command:      n.log[n.lastApplied].Command,
-				CommandIndex: n.lastApplied,
-			}
-			n.mu.Unlock()
-			select {
-			case n.applyCh <- msg:
-			case <-n.stopCh:
-				n.mu.Lock()
-				return
-			}
-			n.mu.Lock()
+		n.mu.Unlock()
+		select {
+		case n.applyCh <- msg:
+		case <-n.stopCh:
 		}
+		n.mu.Lock()
 	}
 }
 
@@ -441,7 +422,7 @@ func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 
 	reply := RequestVoteReply{Term: n.currentTerm}
 
-	if args.Term < n.currentTerm {
+	if n.killed() || args.Term < n.currentTerm {
 		return reply
 	}
 	if args.Term > n.currentTerm {
@@ -466,7 +447,7 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 
 	reply := AppendEntriesReply{Term: n.currentTerm}
 
-	if args.Term < n.currentTerm {
+	if n.killed() || args.Term < n.currentTerm {
 		return reply
 	}
 	if args.Term > n.currentTerm {

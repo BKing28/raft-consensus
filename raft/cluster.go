@@ -1,8 +1,12 @@
 package raft
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 type Cluster struct {
+	mu         sync.Mutex
 	Nodes      []*Node
 	ApplyChans []chan ApplyMsg
 	Storage    []*MemStorage
@@ -13,55 +17,47 @@ type Cluster struct {
 }
 
 func NewCluster(size int, seed int64, faults FaultConfig) *Cluster {
-	transport := NewSimTransport(seed, faults)
-	nodes := make([]*Node, size)
-	applyChans := make([]chan ApplyMsg, size)
-	storage := make([]*MemStorage, size)
-
-	for i := 0; i < size; i++ {
-		id := NodeID(i)
-		var peers []NodeID
-		for j := 0; j < size; j++ {
-			if j != i {
-				peers = append(peers, NodeID(j))
-			}
-		}
-		applyChans[i] = make(chan ApplyMsg, 100)
-		storage[i] = NewMemStorage()
-		nodes[i] = NewNode(id, peers, transport, storage[i], applyChans[i], seed+int64(i))
-		transport.RegisterNode(id, nodes[i])
-	}
-
-	return &Cluster{
-		Nodes:      nodes,
-		ApplyChans: applyChans,
-		Storage:    storage,
-		Transport:  transport,
+	c := &Cluster{
+		Nodes:      make([]*Node, size),
+		ApplyChans: make([]chan ApplyMsg, size),
+		Storage:    make([]*MemStorage, size),
+		Transport:  NewSimTransport(seed, faults),
 		size:       size,
 		seed:       seed,
 		restarts:   make([]int, size),
 	}
+	for i := range size {
+		c.ApplyChans[i] = make(chan ApplyMsg, 100)
+		c.Storage[i] = NewMemStorage()
+		c.Nodes[i] = c.newNode(NodeID(i))
+	}
+	return c
 }
 
 func (c *Cluster) Start() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, node := range c.Nodes {
-		node.Start()
+		c.launch(node)
 	}
 }
 
 func (c *Cluster) Stop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, node := range c.Nodes {
 		node.Stop()
 	}
 }
 
 func (c *Cluster) Leader() *Node {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, node := range c.Nodes {
 		if node.killed() {
 			continue
 		}
-		_, role := node.GetState()
-		if role == Leader {
+		if _, role := node.GetState(); role == Leader {
 			return node
 		}
 	}
@@ -80,18 +76,37 @@ func (c *Cluster) WaitForLeader(timeout time.Duration) *Node {
 }
 
 func (c *Cluster) CrashNode(id NodeID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.Nodes[id].Stop()
 }
 
 func (c *Cluster) RestartNode(id NodeID) {
-	old := c.Nodes[id]
-	ch := make(chan ApplyMsg, 100)
-	c.ApplyChans[id] = ch
-
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.Nodes[id].Stop()
 	c.restarts[id]++
-	seed := c.seed + int64(id) + int64(c.size)*int64(c.restarts[id])
-	node := NewNode(old.id, old.peers, c.Transport, c.Storage[id], ch, seed)
-	c.Nodes[id] = node
+	c.Nodes[id] = c.newNode(id)
+	c.launch(c.Nodes[id])
+}
+
+func (c *Cluster) newNode(id NodeID) *Node {
+	var peers []NodeID
+	for i := range c.size {
+		if NodeID(i) != id {
+			peers = append(peers, NodeID(i))
+		}
+	}
+	return NewNode(id, peers, c.Transport, c.Storage[id], c.ApplyChans[id], c.nodeSeed(id))
+}
+
+// Registers only after Start so no RPC reaches a node before it has restored its state.
+func (c *Cluster) launch(node *Node) {
 	node.Start()
-	c.Transport.RegisterNode(id, node)
+	c.Transport.RegisterNode(node.id, node)
+}
+
+// Distinct from the transport seed and from every other incarnation of every node.
+func (c *Cluster) nodeSeed(id NodeID) int64 {
+	return c.seed + 1 + int64(id) + int64(c.size)*int64(c.restarts[id])
 }
