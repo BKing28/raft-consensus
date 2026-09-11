@@ -4,16 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"sync"
-	"time"
+	"maps"
+	"slices"
 )
 
-const RequestTimeout = time.Second
-
-var (
-	ErrNotLeader = errors.New("not leader")
-	ErrTimeout   = errors.New("request timed out")
-)
+var ErrNotLeader = errors.New("not leader")
 
 type Op int
 
@@ -43,11 +38,10 @@ type applied struct {
 
 type waiter struct {
 	data []byte
-	ch   chan Result
+	done func(Result, error)
 }
 
 type KVStore struct {
-	mu      sync.Mutex
 	node    *Node
 	data    map[string]string
 	clients map[int64]applied
@@ -61,62 +55,49 @@ func NewKVStore(node *Node) *KVStore {
 		clients: make(map[int64]applied),
 		waiters: make(map[int]waiter),
 	}
-	go kv.applyLoop()
+	node.apply = kv.applyMsg
 	return kv
 }
 
 // Reads go through the log too, so a deposed leader can never answer with stale data.
-func (kv *KVStore) Do(cmd Command) (Result, error) {
+func (kv *KVStore) Do(cmd Command, done func(Result, error)) {
+	if kv.node.killed() || kv.node.role != Leader {
+		done(Result{}, ErrNotLeader)
+		return
+	}
 	data, _ := json.Marshal(cmd)
-
-	kv.mu.Lock()
-	index, _, isLeader := kv.node.Submit(data)
-	if !isLeader {
-		kv.mu.Unlock()
-		return Result{}, ErrNotLeader
-	}
-	ch := make(chan Result, 1)
+	index := kv.node.lastLogIndex() + 1
 	if old, ok := kv.waiters[index]; ok {
-		close(old.ch)
+		old.done(Result{}, ErrNotLeader)
 	}
-	kv.waiters[index] = waiter{data, ch}
-	kv.mu.Unlock()
+	kv.waiters[index] = waiter{data, done}
+	kv.node.Submit(data)
+}
 
-	select {
-	case res, ok := <-ch:
-		if !ok {
-			return Result{}, ErrNotLeader
-		}
-		return res, nil
-	case <-time.After(RequestTimeout):
-		return Result{}, ErrTimeout
+// Callbacks fire in index order; map order would not be deterministic.
+func (kv *KVStore) Stop() {
+	for _, index := range slices.Sorted(maps.Keys(kv.waiters)) {
+		kv.waiters[index].done(Result{}, ErrNotLeader)
 	}
+	clear(kv.waiters)
 }
 
 // A different command landing at a waiter's index means leadership changed, so the waiter is failed.
-func (kv *KVStore) applyLoop() {
-	for msg := range kv.node.applyCh {
-		kv.mu.Lock()
-		var res Result
-		if msg.Command != nil {
-			res = kv.apply(decode(msg.Command))
-		}
-		if w, ok := kv.waiters[msg.CommandIndex]; ok {
-			delete(kv.waiters, msg.CommandIndex)
-			if bytes.Equal(w.data, msg.Command) {
-				w.ch <- res
-			} else {
-				close(w.ch)
-			}
-		}
-		kv.mu.Unlock()
+func (kv *KVStore) applyMsg(msg ApplyMsg) {
+	var res Result
+	if msg.Command != nil {
+		res = kv.apply(decode(msg.Command))
 	}
-
-	kv.mu.Lock()
-	for _, w := range kv.waiters {
-		close(w.ch)
+	w, ok := kv.waiters[msg.CommandIndex]
+	if !ok {
+		return
 	}
-	kv.mu.Unlock()
+	delete(kv.waiters, msg.CommandIndex)
+	if bytes.Equal(w.data, msg.Command) {
+		w.done(res, nil)
+	} else {
+		w.done(Result{}, ErrNotLeader)
+	}
 }
 
 // Clients send one request at a time, so a request at or below the last applied ID is a retry.

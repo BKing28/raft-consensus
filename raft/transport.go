@@ -1,7 +1,7 @@
 package raft
 
 type Transport interface {
-	SendRequestVote(target NodeID, args RequestVoteArgs) (RequestVoteReply, error)
-	SendAppendEntries(target NodeID, args AppendEntriesArgs) (AppendEntriesReply, error)
-	SendInstallSnapshot(target NodeID, args InstallSnapshotArgs) (InstallSnapshotReply, error)
+	SendRequestVote(from, to NodeID, args RequestVoteArgs)
+	SendAppendEntries(from, to NodeID, args AppendEntriesArgs)
+	SendInstallSnapshot(from, to NodeID, args InstallSnapshotArgs)
 }

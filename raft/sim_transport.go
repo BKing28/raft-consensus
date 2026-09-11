@@ -1,11 +1,6 @@
 package raft
 
-import (
-	"fmt"
-	"math/rand"
-	"sync"
-	"time"
-)
+import "time"
 
 const minReorderHold = 10 * time.Millisecond
 
@@ -18,31 +13,26 @@ type FaultConfig struct {
 }
 
 type SimTransport struct {
-	mu         sync.Mutex
+	sim        *Sim
 	nodes      map[NodeID]*Node
 	partitions map[NodeID]map[NodeID]bool
 	faults     FaultConfig
-	rng        *rand.Rand
 }
 
-func NewSimTransport(seed int64, faults FaultConfig) *SimTransport {
+func NewSimTransport(sim *Sim, faults FaultConfig) *SimTransport {
 	return &SimTransport{
+		sim:        sim,
 		nodes:      make(map[NodeID]*Node),
 		partitions: make(map[NodeID]map[NodeID]bool),
 		faults:     faults,
-		rng:        rand.New(rand.NewSource(seed)),
 	}
 }
 
 func (st *SimTransport) RegisterNode(id NodeID, node *Node) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
 	st.nodes[id] = node
 }
 
 func (st *SimTransport) Partition(group1, group2 []NodeID) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
 	for _, a := range group1 {
 		for _, b := range group2 {
 			if st.partitions[a] == nil {
@@ -58,8 +48,6 @@ func (st *SimTransport) Partition(group1, group2 []NodeID) {
 }
 
 func (st *SimTransport) Heal() {
-	st.mu.Lock()
-	defer st.mu.Unlock()
 	st.partitions = make(map[NodeID]map[NodeID]bool)
 }
 
@@ -72,92 +60,69 @@ func (st *SimTransport) randomDelay() time.Duration {
 		return st.faults.MinDelay
 	}
 	spread := int64(st.faults.MaxDelay - st.faults.MinDelay)
-	return st.faults.MinDelay + time.Duration(st.rng.Int63n(spread))
+	return st.faults.MinDelay + time.Duration(st.sim.rng.Int63n(spread))
 }
 
 // A reordered message is held back long enough for later messages to overtake it.
-func (st *SimTransport) plan(from, to NodeID) (drop, dup bool, delay time.Duration) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	drop = st.rng.Float64() < st.faults.DropRate || st.isPartitioned(from, to)
-	dup = st.rng.Float64() < st.faults.DuplicateRate
+func (st *SimTransport) plan() (drop, dup bool, delay time.Duration) {
+	drop = st.sim.rng.Float64() < st.faults.DropRate
+	dup = st.sim.rng.Float64() < st.faults.DuplicateRate
 	delay = st.randomDelay()
-	if st.rng.Float64() < st.faults.ReorderRate {
+	if st.sim.rng.Float64() < st.faults.ReorderRate {
 		delay += max(st.faults.MaxDelay, minReorderHold)
 	}
 	return drop, dup, delay
 }
 
-// Resolved after the delay so partitions and crashes during flight take effect.
-func (st *SimTransport) target(from, to NodeID) (*Node, error) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
+// Resolved at delivery time so partitions and crashes during flight take effect.
+func (st *SimTransport) live(from, to NodeID) *Node {
 	if st.isPartitioned(from, to) {
-		return nil, fmt.Errorf("message dropped")
+		return nil
 	}
-	node := st.nodes[to]
-	if node == nil || node.killed() {
-		return nil, fmt.Errorf("node %d down", to)
+	if node := st.nodes[to]; node != nil && !node.killed() {
+		return node
 	}
-	return node, nil
+	return nil
 }
 
-func (st *SimTransport) SendRequestVote(to NodeID, args RequestVoteArgs) (RequestVoteReply, error) {
-	from := args.CandidateID
-	drop, dup, delay := st.plan(from, to)
-	if drop {
-		return RequestVoteReply{}, fmt.Errorf("message dropped")
-	}
+func (st *SimTransport) deliver(from, to NodeID, delay time.Duration, handle func(*Node)) {
+	st.sim.After(delay, func() {
+		if node := st.live(from, to); node != nil {
+			handle(node)
+		}
+	})
+}
 
-	time.Sleep(delay)
-	node, err := st.target(from, to)
-	if err != nil {
-		return RequestVoteReply{}, err
+func (st *SimTransport) send(from, to NodeID, handle func(*Node)) {
+	drop, dup, delay := st.plan()
+	if drop || st.isPartitioned(from, to) {
+		return
 	}
-	reply := node.HandleRequestVote(args)
-	if node.killed() {
-		return RequestVoteReply{}, fmt.Errorf("node %d down", to)
-	}
-
+	st.deliver(from, to, delay, handle)
 	if dup {
-		go func() {
-			time.Sleep(delay)
-			if node, err := st.target(from, to); err == nil {
-				node.HandleRequestVote(args)
-			}
-		}()
+		st.deliver(from, to, st.randomDelay(), handle)
 	}
-	return reply, nil
 }
 
-func (st *SimTransport) SendAppendEntries(to NodeID, args AppendEntriesArgs) (AppendEntriesReply, error) {
-	from := args.LeaderID
-	drop, dup, delay := st.plan(from, to)
-	if drop {
-		return AppendEntriesReply{}, fmt.Errorf("message dropped")
+func (st *SimTransport) sendReply(from, to NodeID, handle func(*Node)) {
+	if st.sim.rng.Float64() < st.faults.DropRate {
+		return
 	}
-
-	time.Sleep(delay)
-	node, err := st.target(from, to)
-	if err != nil {
-		return AppendEntriesReply{}, err
-	}
-	reply := node.HandleAppendEntries(args)
-	if node.killed() {
-		return AppendEntriesReply{}, fmt.Errorf("node %d down", to)
-	}
-
-	if dup {
-		go func() {
-			time.Sleep(delay)
-			if node, err := st.target(from, to); err == nil {
-				node.HandleAppendEntries(args)
-			}
-		}()
-	}
-	return reply, nil
+	st.deliver(from, to, st.randomDelay(), handle)
 }
 
-func (st *SimTransport) SendInstallSnapshot(to NodeID, args InstallSnapshotArgs) (InstallSnapshotReply, error) {
-	return InstallSnapshotReply{}, fmt.Errorf("not implemented")
+func (st *SimTransport) SendRequestVote(from, to NodeID, args RequestVoteArgs) {
+	st.send(from, to, func(node *Node) {
+		reply := node.HandleRequestVote(args)
+		st.sendReply(to, from, func(sender *Node) { sender.HandleRequestVoteReply(to, args, reply) })
+	})
 }
+
+func (st *SimTransport) SendAppendEntries(from, to NodeID, args AppendEntriesArgs) {
+	st.send(from, to, func(node *Node) {
+		reply := node.HandleAppendEntries(args)
+		st.sendReply(to, from, func(sender *Node) { sender.HandleAppendEntriesReply(to, args, reply) })
+	})
+}
+
+func (st *SimTransport) SendInstallSnapshot(from, to NodeID, args InstallSnapshotArgs) {}

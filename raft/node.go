@@ -2,8 +2,6 @@ package raft
 
 import (
 	"math/rand"
-	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -20,7 +18,6 @@ type ApplyMsg struct {
 }
 
 type Node struct {
-	mu    sync.Mutex
 	id    NodeID
 	peers []NodeID
 
@@ -31,22 +28,23 @@ type Node struct {
 	commitIndex int
 	lastApplied int
 	role        Role
+	votes       map[NodeID]bool
 
 	nextIndex  map[NodeID]int
 	matchIndex map[NodeID]int
 
 	transport        Transport
 	storage          Storage
-	applyCh          chan ApplyMsg
-	applyCond        *sync.Cond
+	apply            func(ApplyMsg)
 	rng              *rand.Rand
-	electionDeadline time.Time
-	dead             int32
-	stopCh           chan struct{}
+	now              time.Duration
+	electionDeadline time.Duration
+	nextHeartbeat    time.Duration
+	dead             bool
 }
 
 func NewNode(id NodeID, peers []NodeID, transport Transport, storage Storage, seed int64) *Node {
-	n := &Node{
+	return &Node{
 		id:         id,
 		peers:      peers,
 		votedFor:   NullVote,
@@ -56,21 +54,14 @@ func NewNode(id NodeID, peers []NodeID, transport Transport, storage Storage, se
 		matchIndex: make(map[NodeID]int),
 		transport:  transport,
 		storage:    storage,
-		applyCh:    make(chan ApplyMsg, 100),
 		rng:        rand.New(rand.NewSource(seed)),
-		stopCh:     make(chan struct{}),
 	}
-	n.applyCond = sync.NewCond(&n.mu)
-	return n
 }
 
-func (n *Node) Start() {
-	n.mu.Lock()
+func (n *Node) Start(now time.Duration) {
+	n.now = now
 	n.restoreFromStorage()
 	n.resetElectionTimer()
-	n.mu.Unlock()
-	go n.electionTicker()
-	go n.applier()
 }
 
 // A node that cannot read its persisted state must not start with amnesia (fail-stop).
@@ -96,17 +87,11 @@ func (n *Node) restoreFromStorage() {
 }
 
 func (n *Node) Stop() {
-	if !atomic.CompareAndSwapInt32(&n.dead, 0, 1) {
-		return
-	}
-	close(n.stopCh)
-	n.mu.Lock()
-	n.applyCond.Broadcast()
-	n.mu.Unlock()
+	n.dead = true
 }
 
 func (n *Node) killed() bool {
-	return atomic.LoadInt32(&n.dead) == 1
+	return n.dead
 }
 
 func (n *Node) ID() NodeID {
@@ -114,8 +99,6 @@ func (n *Node) ID() NodeID {
 }
 
 func (n *Node) GetState() (int, Role) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
 	return n.currentTerm, n.role
 }
 
@@ -133,18 +116,22 @@ func (n *Node) randomElectionTimeout() time.Duration {
 }
 
 func (n *Node) resetElectionTimer() {
-	n.electionDeadline = time.Now().Add(n.randomElectionTimeout())
+	n.electionDeadline = n.now + n.randomElectionTimeout()
 }
 
-func (n *Node) electionTicker() {
-	for !n.killed() {
-		time.Sleep(ElectionTick)
-		n.mu.Lock()
-		if !n.killed() && n.role != Leader && time.Now().After(n.electionDeadline) {
-			n.startElection()
-			n.resetElectionTimer()
-		}
-		n.mu.Unlock()
+// Handlers reset deadlines from the last tick time, so they can be up to one tick stale.
+func (n *Node) Tick(now time.Duration) {
+	if n.killed() {
+		return
+	}
+	n.now = now
+	if n.role != Leader && now >= n.electionDeadline {
+		n.startElection()
+		n.resetElectionTimer()
+	}
+	if n.role == Leader && now >= n.nextHeartbeat {
+		n.broadcastAppendEntries()
+		n.nextHeartbeat = now + HeartbeatInterval
 	}
 }
 
@@ -191,15 +178,12 @@ func (n *Node) becomeLeader() {
 	n.advanceCommitIndex()
 
 	n.broadcastAppendEntries()
-	go n.heartbeatTicker()
+	n.nextHeartbeat = n.now + HeartbeatInterval
 }
 
-func (n *Node) Submit(command []byte) (index int, term int, isLeader bool) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
+func (n *Node) Submit(command []byte) {
 	if n.killed() || n.role != Leader {
-		return -1, n.currentTerm, false
+		return
 	}
 
 	entry := LogEntry{
@@ -212,8 +196,6 @@ func (n *Node) Submit(command []byte) (index int, term int, isLeader bool) {
 	n.matchIndex[n.id] = entry.Index
 	n.advanceCommitIndex()
 	n.broadcastAppendEntries()
-
-	return entry.Index, n.currentTerm, true
 }
 
 func (n *Node) startElection() {
@@ -226,42 +208,33 @@ func (n *Node) startElection() {
 		return
 	}
 
-	votes := 1
-	term := n.currentTerm
-	lastIdx := n.lastLogIndex()
-	lastTerm := n.lastLogTerm()
-
+	n.votes = map[NodeID]bool{n.id: true}
+	args := RequestVoteArgs{
+		Term:         n.currentTerm,
+		CandidateID:  n.id,
+		LastLogIndex: n.lastLogIndex(),
+		LastLogTerm:  n.lastLogTerm(),
+	}
 	for _, peer := range n.peers {
-		go func(peer NodeID) {
-			args := RequestVoteArgs{
-				Term:         term,
-				CandidateID:  n.id,
-				LastLogIndex: lastIdx,
-				LastLogTerm:  lastTerm,
-			}
-			reply, err := n.transport.SendRequestVote(peer, args)
-			if err != nil {
-				return
-			}
+		n.transport.SendRequestVote(n.id, peer, args)
+	}
+}
 
-			n.mu.Lock()
-			defer n.mu.Unlock()
-
-			if n.killed() || n.currentTerm != term || n.role != Candidate {
-				return
-			}
-			if reply.Term > n.currentTerm {
-				n.becomeFollower(reply.Term)
-				n.resetElectionTimer()
-				return
-			}
-			if reply.VoteGranted {
-				votes++
-				if votes > (len(n.peers)+1)/2 {
-					n.becomeLeader()
-				}
-			}
-		}(peer)
+// Votes are a set because a duplicated request produces a duplicated reply.
+func (n *Node) HandleRequestVoteReply(from NodeID, args RequestVoteArgs, reply RequestVoteReply) {
+	if n.killed() || args.Term != n.currentTerm || n.role != Candidate {
+		return
+	}
+	if reply.Term > n.currentTerm {
+		n.becomeFollower(reply.Term)
+		n.resetElectionTimer()
+		return
+	}
+	if reply.VoteGranted {
+		n.votes[from] = true
+		if len(n.votes) > (len(n.peers)+1)/2 {
+			n.becomeLeader()
+		}
 	}
 }
 
@@ -273,38 +246,13 @@ func (n *Node) isLogUpToDate(lastIndex, lastTerm int) bool {
 	return lastIndex >= n.lastLogIndex()
 }
 
-func (n *Node) heartbeatTicker() {
-	ticker := time.NewTicker(HeartbeatInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-n.stopCh:
-			return
-		case <-ticker.C:
-			n.mu.Lock()
-			if n.role != Leader {
-				n.mu.Unlock()
-				return
-			}
-			n.broadcastAppendEntries()
-			n.mu.Unlock()
-		}
-	}
-}
-
 func (n *Node) broadcastAppendEntries() {
 	for _, peer := range n.peers {
-		go n.sendAppendEntries(peer)
+		n.sendAppendEntries(peer)
 	}
 }
 
 func (n *Node) sendAppendEntries(peer NodeID) {
-	n.mu.Lock()
-	if n.killed() || n.role != Leader {
-		n.mu.Unlock()
-		return
-	}
-
 	next := n.nextIndex[peer]
 	prevLogIndex := next - 1
 	prevLogTerm := 0
@@ -318,26 +266,18 @@ func (n *Node) sendAppendEntries(peer NodeID) {
 		copy(entries, n.log[next:])
 	}
 
-	args := AppendEntriesArgs{
+	n.transport.SendAppendEntries(n.id, peer, AppendEntriesArgs{
 		Term:         n.currentTerm,
 		LeaderID:     n.id,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm,
 		Entries:      entries,
 		LeaderCommit: n.commitIndex,
-	}
-	term := n.currentTerm
-	n.mu.Unlock()
+	})
+}
 
-	reply, err := n.transport.SendAppendEntries(peer, args)
-	if err != nil {
-		return
-	}
-
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if n.killed() || n.currentTerm != term || n.role != Leader {
+func (n *Node) HandleAppendEntriesReply(from NodeID, args AppendEntriesArgs, reply AppendEntriesReply) {
+	if n.killed() || args.Term != n.currentTerm || n.role != Leader {
 		return
 	}
 	if reply.Term > n.currentTerm {
@@ -347,11 +287,11 @@ func (n *Node) sendAppendEntries(peer NodeID) {
 	}
 
 	if reply.Success {
-		match := prevLogIndex + len(entries)
-		if match > n.matchIndex[peer] {
-			n.matchIndex[peer] = match
+		match := args.PrevLogIndex + len(args.Entries)
+		if match > n.matchIndex[from] {
+			n.matchIndex[from] = match
 		}
-		n.nextIndex[peer] = match + 1
+		n.nextIndex[from] = match + 1
 		n.advanceCommitIndex()
 	} else {
 		if reply.ConflictTerm > 0 {
@@ -363,17 +303,17 @@ func (n *Node) sendAppendEntries(peer NodeID) {
 				}
 			}
 			if lastOfTerm > 0 {
-				n.nextIndex[peer] = lastOfTerm + 1
+				n.nextIndex[from] = lastOfTerm + 1
 			} else {
-				n.nextIndex[peer] = reply.ConflictIndex
+				n.nextIndex[from] = reply.ConflictIndex
 			}
 		} else if reply.ConflictIndex > 0 {
-			n.nextIndex[peer] = reply.ConflictIndex
+			n.nextIndex[from] = reply.ConflictIndex
 		} else {
-			n.nextIndex[peer]--
+			n.nextIndex[from]--
 		}
-		if n.nextIndex[peer] < 1 {
-			n.nextIndex[peer] = 1
+		if n.nextIndex[from] < 1 {
+			n.nextIndex[from] = 1
 		}
 	}
 }
@@ -394,43 +334,20 @@ func (n *Node) advanceCommitIndex() {
 			n.commitIndex = idx
 		}
 	}
-	n.signalApply()
+	n.applyCommitted()
 }
 
-func (n *Node) signalApply() {
-	n.applyCond.Signal()
-}
-
-func (n *Node) applier() {
-	defer close(n.applyCh)
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	for !n.killed() {
-		if n.lastApplied >= n.commitIndex {
-			n.applyCond.Wait()
-			continue
-		}
+func (n *Node) applyCommitted() {
+	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
-		msg := ApplyMsg{
-			Command:      n.log[n.lastApplied].Command,
-			CommandIndex: n.lastApplied,
-		}
-		n.mu.Unlock()
-		select {
-		case n.applyCh <- msg:
-		case <-n.stopCh:
-		}
-		n.mu.Lock()
+		n.apply(ApplyMsg{Command: n.log[n.lastApplied].Command, CommandIndex: n.lastApplied})
 	}
 }
 
 func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
 	reply := RequestVoteReply{Term: n.currentTerm}
 
-	if n.killed() || args.Term < n.currentTerm {
+	if args.Term < n.currentTerm {
 		return reply
 	}
 	if args.Term > n.currentTerm {
@@ -450,12 +367,9 @@ func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 }
 
 func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
 	reply := AppendEntriesReply{Term: n.currentTerm}
 
-	if n.killed() || args.Term < n.currentTerm {
+	if args.Term < n.currentTerm {
 		return reply
 	}
 	if args.Term > n.currentTerm {
@@ -506,7 +420,7 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		}
 		if newCommit > n.commitIndex {
 			n.commitIndex = newCommit
-			n.signalApply()
+			n.applyCommitted()
 		}
 	}
 

@@ -1,12 +1,9 @@
 package raft
 
-import (
-	"sync"
-	"time"
-)
+import "time"
 
 type Cluster struct {
-	mu        sync.Mutex
+	Sim       *Sim
 	Nodes     []*Node
 	Stores    []*KVStore
 	Storage   []*MemStorage
@@ -17,11 +14,13 @@ type Cluster struct {
 }
 
 func NewCluster(size int, seed int64, faults FaultConfig) *Cluster {
+	sim := NewSim(seed)
 	c := &Cluster{
+		Sim:       sim,
 		Nodes:     make([]*Node, size),
 		Stores:    make([]*KVStore, size),
 		Storage:   make([]*MemStorage, size),
-		Transport: NewSimTransport(seed, faults),
+		Transport: NewSimTransport(sim, faults),
 		size:      size,
 		seed:      seed,
 		restarts:  make([]int, size),
@@ -34,24 +33,22 @@ func NewCluster(size int, seed int64, faults FaultConfig) *Cluster {
 }
 
 func (c *Cluster) Start() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	for _, node := range c.Nodes {
 		c.launch(node)
 	}
 }
 
 func (c *Cluster) Stop() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	for _, node := range c.Nodes {
-		node.Stop()
+		c.CrashNode(node.id)
 	}
 }
 
+func (c *Cluster) Run(d time.Duration) {
+	c.Sim.Run(d)
+}
+
 func (c *Cluster) Leader() *Node {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	var leader *Node
 	leaderTerm := -1
 	for _, node := range c.Nodes {
@@ -65,27 +62,20 @@ func (c *Cluster) Leader() *Node {
 	return leader
 }
 
-func (c *Cluster) WaitForLeader(timeout time.Duration) *Node {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if leader := c.Leader(); leader != nil {
-			return leader
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return nil
+func (c *Cluster) WaitForLeader(limit time.Duration) *Node {
+	c.Sim.RunUntil(func() bool { return c.Leader() != nil }, limit)
+	return c.Leader()
 }
 
 func (c *Cluster) CrashNode(id NodeID) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.Nodes[id].Stop()
+	c.Stores[id].Stop()
 }
 
 func (c *Cluster) RestartNode(id NodeID) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.Nodes[id].Stop()
+	if !c.Nodes[id].killed() {
+		c.CrashNode(id)
+	}
 	c.restarts[id]++
 	c.createNode(id)
 	c.launch(c.Nodes[id])
@@ -102,10 +92,20 @@ func (c *Cluster) createNode(id NodeID) {
 	c.Stores[id] = NewKVStore(c.Nodes[id])
 }
 
-// Registers only after Start so no RPC reaches a node before it has restored its state.
 func (c *Cluster) launch(node *Node) {
-	node.Start()
+	node.Start(c.Sim.Now())
 	c.Transport.RegisterNode(node.id, node)
+	c.tick(node)
+}
+
+func (c *Cluster) tick(node *Node) {
+	c.Sim.After(ElectionTick, func() {
+		if node.killed() {
+			return
+		}
+		node.Tick(c.Sim.Now())
+		c.tick(node)
+	})
 }
 
 // Distinct from the transport seed and from every other incarnation of every node.
