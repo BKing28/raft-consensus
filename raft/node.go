@@ -171,7 +171,6 @@ func (n *Node) becomeFollower(term int) {
 	n.currentTerm = term
 	n.votedFor = NullVote
 	n.persist()
-	n.resetElectionTimer()
 }
 
 func (n *Node) becomeLeader() {
@@ -189,6 +188,7 @@ func (n *Node) becomeLeader() {
 	n.log = append(n.log, noop)
 	n.appendToStorage([]LogEntry{noop})
 	n.matchIndex[n.id] = noop.Index
+	n.advanceCommitIndex()
 
 	n.broadcastAppendEntries()
 	go n.heartbeatTicker()
@@ -210,6 +210,7 @@ func (n *Node) Submit(command []byte) (index int, term int, isLeader bool) {
 	n.log = append(n.log, entry)
 	n.appendToStorage([]LogEntry{entry})
 	n.matchIndex[n.id] = entry.Index
+	n.advanceCommitIndex()
 	n.broadcastAppendEntries()
 
 	return entry.Index, n.currentTerm, true
@@ -220,6 +221,10 @@ func (n *Node) startElection() {
 	n.role = Candidate
 	n.votedFor = n.id
 	n.persist()
+	if len(n.peers) == 0 {
+		n.becomeLeader()
+		return
+	}
 
 	votes := 1
 	term := n.currentTerm
@@ -247,6 +252,7 @@ func (n *Node) startElection() {
 			}
 			if reply.Term > n.currentTerm {
 				n.becomeFollower(reply.Term)
+				n.resetElectionTimer()
 				return
 			}
 			if reply.VoteGranted {
@@ -336,6 +342,7 @@ func (n *Node) sendAppendEntries(peer NodeID) {
 	}
 	if reply.Term > n.currentTerm {
 		n.becomeFollower(reply.Term)
+		n.resetElectionTimer()
 		return
 	}
 

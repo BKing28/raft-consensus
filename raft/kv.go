@@ -76,6 +76,9 @@ func (kv *KVStore) Do(cmd Command) (Result, error) {
 		return Result{}, ErrNotLeader
 	}
 	ch := make(chan Result, 1)
+	if old, ok := kv.waiters[index]; ok {
+		close(old.ch)
+	}
 	kv.waiters[index] = waiter{data, ch}
 	kv.mu.Unlock()
 
@@ -116,6 +119,7 @@ func (kv *KVStore) applyLoop() {
 	kv.mu.Unlock()
 }
 
+// Clients send one request at a time, so a request at or below the last applied ID is a retry.
 func (kv *KVStore) apply(cmd Command) Result {
 	if last, ok := kv.clients[cmd.ClientID]; ok && cmd.RequestID <= last.requestID {
 		return last.result

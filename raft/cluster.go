@@ -52,15 +52,17 @@ func (c *Cluster) Stop() {
 func (c *Cluster) Leader() *Node {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	var leader *Node
+	leaderTerm := -1
 	for _, node := range c.Nodes {
 		if node.killed() {
 			continue
 		}
-		if _, role := node.GetState(); role == Leader {
-			return node
+		if term, role := node.GetState(); role == Leader && term > leaderTerm {
+			leader, leaderTerm = node, term
 		}
 	}
-	return nil
+	return leader
 }
 
 func (c *Cluster) WaitForLeader(timeout time.Duration) *Node {
