@@ -45,7 +45,7 @@ type Node struct {
 	stopCh           chan struct{}
 }
 
-func NewNode(id NodeID, peers []NodeID, transport Transport, storage Storage, applyCh chan ApplyMsg, seed int64) *Node {
+func NewNode(id NodeID, peers []NodeID, transport Transport, storage Storage, seed int64) *Node {
 	n := &Node{
 		id:         id,
 		peers:      peers,
@@ -56,7 +56,7 @@ func NewNode(id NodeID, peers []NodeID, transport Transport, storage Storage, ap
 		matchIndex: make(map[NodeID]int),
 		transport:  transport,
 		storage:    storage,
-		applyCh:    applyCh,
+		applyCh:    make(chan ApplyMsg, 100),
 		rng:        rand.New(rand.NewSource(seed)),
 		stopCh:     make(chan struct{}),
 	}
@@ -395,6 +395,7 @@ func (n *Node) signalApply() {
 }
 
 func (n *Node) applier() {
+	defer close(n.applyCh)
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for !n.killed() {

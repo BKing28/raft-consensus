@@ -6,30 +6,29 @@ import (
 )
 
 type Cluster struct {
-	mu         sync.Mutex
-	Nodes      []*Node
-	ApplyChans []chan ApplyMsg
-	Storage    []*MemStorage
-	Transport  *SimTransport
-	size       int
-	seed       int64
-	restarts   []int
+	mu        sync.Mutex
+	Nodes     []*Node
+	Stores    []*KVStore
+	Storage   []*MemStorage
+	Transport *SimTransport
+	size      int
+	seed      int64
+	restarts  []int
 }
 
 func NewCluster(size int, seed int64, faults FaultConfig) *Cluster {
 	c := &Cluster{
-		Nodes:      make([]*Node, size),
-		ApplyChans: make([]chan ApplyMsg, size),
-		Storage:    make([]*MemStorage, size),
-		Transport:  NewSimTransport(seed, faults),
-		size:       size,
-		seed:       seed,
-		restarts:   make([]int, size),
+		Nodes:     make([]*Node, size),
+		Stores:    make([]*KVStore, size),
+		Storage:   make([]*MemStorage, size),
+		Transport: NewSimTransport(seed, faults),
+		size:      size,
+		seed:      seed,
+		restarts:  make([]int, size),
 	}
 	for i := range size {
-		c.ApplyChans[i] = make(chan ApplyMsg, 100)
 		c.Storage[i] = NewMemStorage()
-		c.Nodes[i] = c.newNode(NodeID(i))
+		c.createNode(NodeID(i))
 	}
 	return c
 }
@@ -86,18 +85,19 @@ func (c *Cluster) RestartNode(id NodeID) {
 	defer c.mu.Unlock()
 	c.Nodes[id].Stop()
 	c.restarts[id]++
-	c.Nodes[id] = c.newNode(id)
+	c.createNode(id)
 	c.launch(c.Nodes[id])
 }
 
-func (c *Cluster) newNode(id NodeID) *Node {
+func (c *Cluster) createNode(id NodeID) {
 	var peers []NodeID
 	for i := range c.size {
 		if NodeID(i) != id {
 			peers = append(peers, NodeID(i))
 		}
 	}
-	return NewNode(id, peers, c.Transport, c.Storage[id], c.ApplyChans[id], c.nodeSeed(id))
+	c.Nodes[id] = NewNode(id, peers, c.Transport, c.Storage[id], c.nodeSeed(id))
+	c.Stores[id] = NewKVStore(c.Nodes[id])
 }
 
 // Registers only after Start so no RPC reaches a node before it has restored its state.
