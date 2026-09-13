@@ -35,5 +35,6 @@ func main() {
 		}
 	}
 	fmt.Printf("seed %d: %d requests, %d completed, %d incomplete\n", cfg.Seed, len(history), done, len(history)-done)
+	fmt.Printf("linearizable: %v\n", harness.Check(history))
 	fmt.Printf("replay identical: %v\n", slices.Equal(history, harness.Run(cfg)))
 }
