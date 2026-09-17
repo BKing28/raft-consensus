@@ -7,4 +7,6 @@ type Storage interface {
 	LastIndex() (int, error)
 	AppendLogs(entries []LogEntry) error
 	TruncateFrom(index int) error
+	SaveSnapshot(index, term int, data []byte) error
+	LoadSnapshot() (index, term int, data []byte, err error)
 }

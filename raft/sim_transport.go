@@ -125,4 +125,9 @@ func (st *SimTransport) SendAppendEntries(from, to NodeID, args AppendEntriesArg
 	})
 }
 
-func (st *SimTransport) SendInstallSnapshot(from, to NodeID, args InstallSnapshotArgs) {}
+func (st *SimTransport) SendInstallSnapshot(from, to NodeID, args InstallSnapshotArgs) {
+	st.send(from, to, func(node *Node) {
+		reply := node.HandleInstallSnapshot(args)
+		st.sendReply(to, from, func(sender *Node) { sender.HandleInstallSnapshotReply(to, args, reply) })
+	})
+}

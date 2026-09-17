@@ -32,8 +32,13 @@ type Result struct {
 }
 
 type applied struct {
-	requestID int64
-	result    Result
+	RequestID int64
+	Result    Result
+}
+
+type kvState struct {
+	Data    map[string]string
+	Clients map[int64]applied
 }
 
 type waiter struct {
@@ -56,6 +61,8 @@ func NewKVStore(node *Node) *KVStore {
 		waiters: make(map[int]waiter),
 	}
 	node.apply = kv.applyMsg
+	node.save = kv.save
+	node.restore = kv.restore
 	return kv
 }
 
@@ -74,12 +81,30 @@ func (kv *KVStore) Do(cmd Command, done func(Result, error)) {
 	kv.node.Submit(data)
 }
 
-// Callbacks fire in index order; map order would not be deterministic.
 func (kv *KVStore) Stop() {
+	kv.failWaiters()
+}
+
+// Callbacks fire in index order; map order would not be deterministic.
+func (kv *KVStore) failWaiters() {
 	for _, index := range slices.Sorted(maps.Keys(kv.waiters)) {
 		kv.waiters[index].done(Result{}, ErrNotLeader)
 	}
 	clear(kv.waiters)
+}
+
+func (kv *KVStore) save() []byte {
+	data, _ := json.Marshal(kvState{kv.data, kv.clients})
+	return data
+}
+
+func (kv *KVStore) restore(data []byte) {
+	var state kvState
+	if err := json.Unmarshal(data, &state); err != nil {
+		panic(err)
+	}
+	kv.data, kv.clients = state.Data, state.Clients
+	kv.failWaiters()
 }
 
 // A different command landing at a waiter's index means leadership changed, so the waiter is failed.
@@ -102,8 +127,8 @@ func (kv *KVStore) applyMsg(msg ApplyMsg) {
 
 // Clients send one request at a time, so a request at or below the last applied ID is a retry.
 func (kv *KVStore) apply(cmd Command) Result {
-	if last, ok := kv.clients[cmd.ClientID]; ok && cmd.RequestID <= last.requestID {
-		return last.result
+	if last, ok := kv.clients[cmd.ClientID]; ok && cmd.RequestID <= last.RequestID {
+		return last.Result
 	}
 	var res Result
 	switch cmd.Op {

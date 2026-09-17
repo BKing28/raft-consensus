@@ -2,6 +2,7 @@ package raft
 
 import (
 	"math/rand"
+	"slices"
 	"time"
 )
 
@@ -10,6 +11,7 @@ const (
 	ElectionTimeoutMax = 300 * time.Millisecond
 	ElectionTick       = 10 * time.Millisecond
 	HeartbeatInterval  = 50 * time.Millisecond
+	SnapshotThreshold  = 50
 )
 
 type ApplyMsg struct {
@@ -36,6 +38,9 @@ type Node struct {
 	transport        Transport
 	storage          Storage
 	apply            func(ApplyMsg)
+	save             func() []byte
+	restore          func([]byte)
+	snapshot         []byte
 	rng              *rand.Rand
 	now              time.Duration
 	electionDeadline time.Duration
@@ -73,12 +78,24 @@ func (n *Node) restoreFromStorage() {
 	n.currentTerm = term
 	n.votedFor = votedFor
 
+	snapIndex, snapTerm, data, err := n.storage.LoadSnapshot()
+	if err != nil {
+		panic(err)
+	}
+	if snapIndex > 0 {
+		n.log[0] = LogEntry{Term: snapTerm, Index: snapIndex}
+		n.snapshot = data
+		n.restore(data)
+		n.commitIndex = snapIndex
+		n.lastApplied = snapIndex
+	}
+
 	lastIdx, err := n.storage.LastIndex()
 	if err != nil {
 		panic(err)
 	}
-	if lastIdx > 0 {
-		entries, err := n.storage.GetLogRange(1, lastIdx)
+	if lastIdx > snapIndex {
+		entries, err := n.storage.GetLogRange(snapIndex+1, lastIdx)
 		if err != nil {
 			panic(err)
 		}
@@ -103,11 +120,19 @@ func (n *Node) GetState() (int, Role) {
 }
 
 func (n *Node) lastLogIndex() int {
-	return len(n.log) - 1
+	return n.log[0].Index + len(n.log) - 1
 }
 
 func (n *Node) lastLogTerm() int {
-	return n.log[n.lastLogIndex()].Term
+	return n.log[len(n.log)-1].Term
+}
+
+func (n *Node) entry(index int) LogEntry {
+	return n.log[index-n.log[0].Index]
+}
+
+func (n *Node) entriesFrom(index int) []LogEntry {
+	return n.log[index-n.log[0].Index:]
 }
 
 func (n *Node) randomElectionTimeout() time.Duration {
@@ -149,6 +174,12 @@ func (n *Node) appendToStorage(entries []LogEntry) {
 
 func (n *Node) truncateStorage(index int) {
 	if err := n.storage.TruncateFrom(index); err != nil {
+		panic(err)
+	}
+}
+
+func (n *Node) persistSnapshot() {
+	if err := n.storage.SaveSnapshot(n.log[0].Index, n.log[0].Term, n.snapshot); err != nil {
 		panic(err)
 	}
 }
@@ -254,24 +285,23 @@ func (n *Node) broadcastAppendEntries() {
 
 func (n *Node) sendAppendEntries(peer NodeID) {
 	next := n.nextIndex[peer]
-	prevLogIndex := next - 1
-	prevLogTerm := 0
-	if prevLogIndex > 0 && prevLogIndex < len(n.log) {
-		prevLogTerm = n.log[prevLogIndex].Term
-	}
-
-	var entries []LogEntry
-	if next <= n.lastLogIndex() {
-		entries = make([]LogEntry, len(n.log[next:]))
-		copy(entries, n.log[next:])
+	if next <= n.log[0].Index {
+		n.transport.SendInstallSnapshot(n.id, peer, InstallSnapshotArgs{
+			Term:              n.currentTerm,
+			LeaderID:          n.id,
+			LastIncludedIndex: n.log[0].Index,
+			LastIncludedTerm:  n.log[0].Term,
+			Data:              n.snapshot,
+		})
+		return
 	}
 
 	n.transport.SendAppendEntries(n.id, peer, AppendEntriesArgs{
 		Term:         n.currentTerm,
 		LeaderID:     n.id,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  prevLogTerm,
-		Entries:      entries,
+		PrevLogIndex: next - 1,
+		PrevLogTerm:  n.entry(next - 1).Term,
+		Entries:      slices.Clone(n.entriesFrom(next)),
 		LeaderCommit: n.commitIndex,
 	})
 }
@@ -296,8 +326,8 @@ func (n *Node) HandleAppendEntriesReply(from NodeID, args AppendEntriesArgs, rep
 	} else {
 		if reply.ConflictTerm > 0 {
 			lastOfTerm := -1
-			for i := n.lastLogIndex(); i >= 1; i-- {
-				if n.log[i].Term == reply.ConflictTerm {
+			for i := n.lastLogIndex(); i >= n.log[0].Index; i-- {
+				if n.entry(i).Term == reply.ConflictTerm {
 					lastOfTerm = i
 					break
 				}
@@ -321,7 +351,7 @@ func (n *Node) HandleAppendEntriesReply(from NodeID, args AppendEntriesArgs, rep
 // Only commit entries from the leader's current term
 func (n *Node) advanceCommitIndex() {
 	for idx := n.commitIndex + 1; idx <= n.lastLogIndex(); idx++ {
-		if n.log[idx].Term != n.currentTerm {
+		if n.entry(idx).Term != n.currentTerm {
 			continue
 		}
 		count := 1
@@ -340,8 +370,18 @@ func (n *Node) advanceCommitIndex() {
 func (n *Node) applyCommitted() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
-		n.apply(ApplyMsg{Command: n.log[n.lastApplied].Command, CommandIndex: n.lastApplied})
+		n.apply(ApplyMsg{Command: n.entry(n.lastApplied).Command, CommandIndex: n.lastApplied})
 	}
+	if n.lastApplied-n.log[0].Index >= SnapshotThreshold {
+		n.compact()
+	}
+}
+
+func (n *Node) compact() {
+	term := n.entry(n.lastApplied).Term
+	n.log = append([]LogEntry{{Term: term, Index: n.lastApplied}}, n.entriesFrom(n.lastApplied+1)...)
+	n.snapshot = n.save()
+	n.persistSnapshot()
 }
 
 func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
@@ -380,15 +420,19 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	n.resetElectionTimer()
 	reply.Term = n.currentTerm
 
+	if args.PrevLogIndex < n.log[0].Index {
+		reply.ConflictIndex = n.log[0].Index + 1
+		return reply
+	}
 	if args.PrevLogIndex > 0 {
 		if args.PrevLogIndex > n.lastLogIndex() {
 			reply.ConflictIndex = n.lastLogIndex() + 1
 			return reply
 		}
-		if n.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-			reply.ConflictTerm = n.log[args.PrevLogIndex].Term
+		if n.entry(args.PrevLogIndex).Term != args.PrevLogTerm {
+			reply.ConflictTerm = n.entry(args.PrevLogIndex).Term
 			idx := args.PrevLogIndex
-			for idx > 1 && n.log[idx-1].Term == reply.ConflictTerm {
+			for idx > n.log[0].Index+1 && n.entry(idx-1).Term == reply.ConflictTerm {
 				idx--
 			}
 			reply.ConflictIndex = idx
@@ -399,8 +443,8 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	for i, entry := range args.Entries {
 		insertIdx := args.PrevLogIndex + 1 + i
 		if insertIdx <= n.lastLogIndex() {
-			if n.log[insertIdx].Term != entry.Term {
-				n.log = n.log[:insertIdx]
+			if n.entry(insertIdx).Term != entry.Term {
+				n.log = n.log[:insertIdx-n.log[0].Index]
 				n.truncateStorage(insertIdx)
 				n.log = append(n.log, args.Entries[i:]...)
 				n.appendToStorage(args.Entries[i:])
@@ -426,4 +470,51 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 
 	reply.Success = true
 	return reply
+}
+
+// Entries after a matching snapshot point may already be committed, so only a mismatched or shorter log is discarded.
+func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotReply {
+	reply := InstallSnapshotReply{Term: n.currentTerm}
+
+	if args.Term < n.currentTerm {
+		return reply
+	}
+	if args.Term > n.currentTerm {
+		n.becomeFollower(args.Term)
+	} else if n.role == Candidate {
+		n.role = Follower
+	}
+	n.resetElectionTimer()
+	reply.Term = n.currentTerm
+
+	if args.LastIncludedIndex <= n.commitIndex {
+		return reply
+	}
+
+	var suffix []LogEntry
+	if args.LastIncludedIndex <= n.lastLogIndex() && n.entry(args.LastIncludedIndex).Term == args.LastIncludedTerm {
+		suffix = n.entriesFrom(args.LastIncludedIndex + 1)
+	} else {
+		n.truncateStorage(args.LastIncludedIndex + 1)
+	}
+	n.log = append([]LogEntry{{Term: args.LastIncludedTerm, Index: args.LastIncludedIndex}}, suffix...)
+	n.snapshot = args.Data
+	n.persistSnapshot()
+	n.restore(args.Data)
+	n.commitIndex = args.LastIncludedIndex
+	n.lastApplied = args.LastIncludedIndex
+	return reply
+}
+
+func (n *Node) HandleInstallSnapshotReply(from NodeID, args InstallSnapshotArgs, reply InstallSnapshotReply) {
+	if n.killed() || args.Term != n.currentTerm || n.role != Leader {
+		return
+	}
+	if reply.Term > n.currentTerm {
+		n.becomeFollower(reply.Term)
+		n.resetElectionTimer()
+		return
+	}
+	n.matchIndex[from] = max(n.matchIndex[from], args.LastIncludedIndex)
+	n.nextIndex[from] = n.matchIndex[from] + 1
 }

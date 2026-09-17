@@ -6,6 +6,9 @@ type MemStorage struct {
 	currentTerm int
 	votedFor    NodeID
 	log         []LogEntry
+	snapIndex   int
+	snapTerm    int
+	snapshot    []byte
 }
 
 func NewMemStorage() *MemStorage {
@@ -23,16 +26,16 @@ func (ms *MemStorage) SetState(currentTerm int, votedFor NodeID) error {
 }
 
 func (ms *MemStorage) GetLogRange(lo, hi int) ([]LogEntry, error) {
-	if lo < 1 || hi > len(ms.log) {
+	if lo <= ms.snapIndex || hi > ms.snapIndex+len(ms.log) {
 		return nil, fmt.Errorf("log range [%d,%d] out of bounds (len=%d)", lo, hi, len(ms.log))
 	}
 	result := make([]LogEntry, hi-lo+1)
-	copy(result, ms.log[lo-1:hi])
+	copy(result, ms.log[lo-1-ms.snapIndex:hi-ms.snapIndex])
 	return result, nil
 }
 
 func (ms *MemStorage) LastIndex() (int, error) {
-	return len(ms.log), nil
+	return ms.snapIndex + len(ms.log), nil
 }
 
 func (ms *MemStorage) AppendLogs(entries []LogEntry) error {
@@ -41,8 +44,18 @@ func (ms *MemStorage) AppendLogs(entries []LogEntry) error {
 }
 
 func (ms *MemStorage) TruncateFrom(index int) error {
-	if index-1 < len(ms.log) {
-		ms.log = ms.log[:index-1]
+	if index-1-ms.snapIndex < len(ms.log) {
+		ms.log = ms.log[:index-1-ms.snapIndex]
 	}
 	return nil
+}
+
+func (ms *MemStorage) SaveSnapshot(index, term int, data []byte) error {
+	ms.log = ms.log[min(index-ms.snapIndex, len(ms.log)):]
+	ms.snapIndex, ms.snapTerm, ms.snapshot = index, term, data
+	return nil
+}
+
+func (ms *MemStorage) LoadSnapshot() (int, int, []byte, error) {
+	return ms.snapIndex, ms.snapTerm, ms.snapshot, nil
 }
