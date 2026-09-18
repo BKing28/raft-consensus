@@ -52,7 +52,7 @@ func Run(cfg Config) []Op {
 		h.startClient(int64(i + 1))
 	}
 	h.scheduleFault()
-	h.cluster.Run(cfg.Duration)
+	h.cluster.Sim.Run(cfg.Duration)
 	return h.history
 }
 

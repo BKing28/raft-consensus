@@ -14,11 +14,6 @@ const (
 	SnapshotThreshold  = 50
 )
 
-type ApplyMsg struct {
-	Command      []byte
-	CommandIndex int
-}
-
 type Node struct {
 	id    NodeID
 	peers []NodeID
@@ -37,7 +32,7 @@ type Node struct {
 
 	transport        Transport
 	storage          Storage
-	apply            func(ApplyMsg)
+	apply            func(index int, command []byte)
 	save             func() []byte
 	restore          func([]byte)
 	snapshot         []byte
@@ -65,58 +60,19 @@ func NewNode(id NodeID, peers []NodeID, transport Transport, storage Storage, se
 
 func (n *Node) Start(now time.Duration) {
 	n.now = now
-	n.restoreFromStorage()
-	n.resetElectionTimer()
-}
-
-// A node that cannot read its persisted state must not start with amnesia (fail-stop).
-func (n *Node) restoreFromStorage() {
-	term, votedFor, err := n.storage.GetState()
-	if err != nil {
-		panic(err)
-	}
-	n.currentTerm = term
-	n.votedFor = votedFor
-
-	snapIndex, snapTerm, data, err := n.storage.LoadSnapshot()
-	if err != nil {
-		panic(err)
-	}
-	if snapIndex > 0 {
-		n.log[0] = LogEntry{Term: snapTerm, Index: snapIndex}
+	n.currentTerm, n.votedFor = n.storage.GetState()
+	if index, term, data := n.storage.LoadSnapshot(); index > 0 {
+		n.log[0] = LogEntry{Term: term, Index: index}
 		n.snapshot = data
 		n.restore(data)
-		n.commitIndex = snapIndex
-		n.lastApplied = snapIndex
+		n.commitIndex, n.lastApplied = index, index
 	}
-
-	lastIdx, err := n.storage.LastIndex()
-	if err != nil {
-		panic(err)
-	}
-	if lastIdx > snapIndex {
-		entries, err := n.storage.GetLogRange(snapIndex+1, lastIdx)
-		if err != nil {
-			panic(err)
-		}
-		n.log = append(n.log[:1], entries...)
-	}
-}
-
-func (n *Node) Stop() {
-	n.dead = true
-}
-
-func (n *Node) killed() bool {
-	return n.dead
+	n.log = append(n.log[:1], n.storage.Entries()...)
+	n.resetElectionTimer()
 }
 
 func (n *Node) ID() NodeID {
 	return n.id
-}
-
-func (n *Node) GetState() (int, Role) {
-	return n.currentTerm, n.role
 }
 
 func (n *Node) lastLogIndex() int {
@@ -146,7 +102,7 @@ func (n *Node) resetElectionTimer() {
 
 // Handlers reset deadlines from the last tick time, so they can be up to one tick stale.
 func (n *Node) Tick(now time.Duration) {
-	if n.killed() {
+	if n.dead {
 		return
 	}
 	n.now = now
@@ -161,27 +117,7 @@ func (n *Node) Tick(now time.Duration) {
 }
 
 func (n *Node) persist() {
-	if err := n.storage.SetState(n.currentTerm, n.votedFor); err != nil {
-		panic(err)
-	}
-}
-
-func (n *Node) appendToStorage(entries []LogEntry) {
-	if err := n.storage.AppendLogs(entries); err != nil {
-		panic(err)
-	}
-}
-
-func (n *Node) truncateStorage(index int) {
-	if err := n.storage.TruncateFrom(index); err != nil {
-		panic(err)
-	}
-}
-
-func (n *Node) persistSnapshot() {
-	if err := n.storage.SaveSnapshot(n.log[0].Index, n.log[0].Term, n.snapshot); err != nil {
-		panic(err)
-	}
+	n.storage.SetState(n.currentTerm, n.votedFor)
 }
 
 func (n *Node) becomeFollower(term int) {
@@ -204,7 +140,7 @@ func (n *Node) becomeLeader() {
 		Command: nil,
 	}
 	n.log = append(n.log, noop)
-	n.appendToStorage([]LogEntry{noop})
+	n.storage.AppendLogs([]LogEntry{noop})
 	n.matchIndex[n.id] = noop.Index
 	n.advanceCommitIndex()
 
@@ -213,7 +149,7 @@ func (n *Node) becomeLeader() {
 }
 
 func (n *Node) Submit(command []byte) {
-	if n.killed() || n.role != Leader {
+	if n.dead || n.role != Leader {
 		return
 	}
 
@@ -223,7 +159,7 @@ func (n *Node) Submit(command []byte) {
 		Command: command,
 	}
 	n.log = append(n.log, entry)
-	n.appendToStorage([]LogEntry{entry})
+	n.storage.AppendLogs([]LogEntry{entry})
 	n.matchIndex[n.id] = entry.Index
 	n.advanceCommitIndex()
 	n.broadcastAppendEntries()
@@ -253,7 +189,7 @@ func (n *Node) startElection() {
 
 // Votes are a set because a duplicated request produces a duplicated reply.
 func (n *Node) HandleRequestVoteReply(from NodeID, args RequestVoteArgs, reply RequestVoteReply) {
-	if n.killed() || args.Term != n.currentTerm || n.role != Candidate {
+	if n.dead || args.Term != n.currentTerm || n.role != Candidate {
 		return
 	}
 	if reply.Term > n.currentTerm {
@@ -307,7 +243,7 @@ func (n *Node) sendAppendEntries(peer NodeID) {
 }
 
 func (n *Node) HandleAppendEntriesReply(from NodeID, args AppendEntriesArgs, reply AppendEntriesReply) {
-	if n.killed() || args.Term != n.currentTerm || n.role != Leader {
+	if n.dead || args.Term != n.currentTerm || n.role != Leader {
 		return
 	}
 	if reply.Term > n.currentTerm {
@@ -370,7 +306,7 @@ func (n *Node) advanceCommitIndex() {
 func (n *Node) applyCommitted() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
-		n.apply(ApplyMsg{Command: n.entry(n.lastApplied).Command, CommandIndex: n.lastApplied})
+		n.apply(n.lastApplied, n.entry(n.lastApplied).Command)
 	}
 	if n.lastApplied-n.log[0].Index >= SnapshotThreshold {
 		n.compact()
@@ -381,7 +317,7 @@ func (n *Node) compact() {
 	term := n.entry(n.lastApplied).Term
 	n.log = append([]LogEntry{{Term: term, Index: n.lastApplied}}, n.entriesFrom(n.lastApplied+1)...)
 	n.snapshot = n.save()
-	n.persistSnapshot()
+	n.storage.SaveSnapshot(n.lastApplied, term, n.snapshot)
 }
 
 func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
@@ -445,14 +381,14 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		if insertIdx <= n.lastLogIndex() {
 			if n.entry(insertIdx).Term != entry.Term {
 				n.log = n.log[:insertIdx-n.log[0].Index]
-				n.truncateStorage(insertIdx)
+				n.storage.TruncateFrom(insertIdx)
 				n.log = append(n.log, args.Entries[i:]...)
-				n.appendToStorage(args.Entries[i:])
+				n.storage.AppendLogs(args.Entries[i:])
 				break
 			}
 		} else {
 			n.log = append(n.log, args.Entries[i:]...)
-			n.appendToStorage(args.Entries[i:])
+			n.storage.AppendLogs(args.Entries[i:])
 			break
 		}
 	}
@@ -495,11 +431,11 @@ func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotRe
 	if args.LastIncludedIndex <= n.lastLogIndex() && n.entry(args.LastIncludedIndex).Term == args.LastIncludedTerm {
 		suffix = n.entriesFrom(args.LastIncludedIndex + 1)
 	} else {
-		n.truncateStorage(args.LastIncludedIndex + 1)
+		n.storage.TruncateFrom(args.LastIncludedIndex + 1)
 	}
 	n.log = append([]LogEntry{{Term: args.LastIncludedTerm, Index: args.LastIncludedIndex}}, suffix...)
 	n.snapshot = args.Data
-	n.persistSnapshot()
+	n.storage.SaveSnapshot(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
 	n.restore(args.Data)
 	n.commitIndex = args.LastIncludedIndex
 	n.lastApplied = args.LastIncludedIndex
@@ -507,7 +443,7 @@ func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) InstallSnapshotRe
 }
 
 func (n *Node) HandleInstallSnapshotReply(from NodeID, args InstallSnapshotArgs, reply InstallSnapshotReply) {
-	if n.killed() || args.Term != n.currentTerm || n.role != Leader {
+	if n.dead || args.Term != n.currentTerm || n.role != Leader {
 		return
 	}
 	if reply.Term > n.currentTerm {

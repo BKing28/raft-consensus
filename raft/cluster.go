@@ -1,14 +1,11 @@
 package raft
 
-import "time"
-
 type Cluster struct {
 	Sim       *Sim
 	Nodes     []*Node
 	Stores    []*KVStore
-	Storage   []*MemStorage
 	Transport *SimTransport
-	size      int
+	storage   []*MemStorage
 	seed      int64
 	restarts  []int
 }
@@ -19,14 +16,13 @@ func NewCluster(size int, seed int64, faults FaultConfig) *Cluster {
 		Sim:       sim,
 		Nodes:     make([]*Node, size),
 		Stores:    make([]*KVStore, size),
-		Storage:   make([]*MemStorage, size),
 		Transport: NewSimTransport(sim, faults),
-		size:      size,
+		storage:   make([]*MemStorage, size),
 		seed:      seed,
 		restarts:  make([]int, size),
 	}
 	for i := range size {
-		c.Storage[i] = NewMemStorage()
+		c.storage[i] = NewMemStorage()
 		c.createNode(NodeID(i))
 	}
 	return c
@@ -38,42 +34,23 @@ func (c *Cluster) Start() {
 	}
 }
 
-func (c *Cluster) Stop() {
-	for _, node := range c.Nodes {
-		c.CrashNode(node.id)
-	}
-}
-
-func (c *Cluster) Run(d time.Duration) {
-	c.Sim.Run(d)
-}
-
 func (c *Cluster) Leader() *Node {
 	var leader *Node
-	leaderTerm := -1
 	for _, node := range c.Nodes {
-		if node.killed() {
-			continue
-		}
-		if term, role := node.GetState(); role == Leader && term > leaderTerm {
-			leader, leaderTerm = node, term
+		if !node.dead && node.role == Leader && (leader == nil || node.currentTerm > leader.currentTerm) {
+			leader = node
 		}
 	}
 	return leader
 }
 
-func (c *Cluster) WaitForLeader(limit time.Duration) *Node {
-	c.Sim.RunUntil(func() bool { return c.Leader() != nil }, limit)
-	return c.Leader()
-}
-
 func (c *Cluster) CrashNode(id NodeID) {
-	c.Nodes[id].Stop()
-	c.Stores[id].Stop()
+	c.Nodes[id].dead = true
+	c.Stores[id].failWaiters()
 }
 
 func (c *Cluster) RestartNode(id NodeID) {
-	if !c.Nodes[id].killed() {
+	if !c.Nodes[id].dead {
 		c.CrashNode(id)
 	}
 	c.restarts[id]++
@@ -83,12 +60,12 @@ func (c *Cluster) RestartNode(id NodeID) {
 
 func (c *Cluster) createNode(id NodeID) {
 	var peers []NodeID
-	for i := range c.size {
+	for i := range c.Nodes {
 		if NodeID(i) != id {
 			peers = append(peers, NodeID(i))
 		}
 	}
-	c.Nodes[id] = NewNode(id, peers, c.Transport, c.Storage[id], c.nodeSeed(id))
+	c.Nodes[id] = NewNode(id, peers, c.Transport, c.storage[id], c.nodeSeed(id))
 	c.Stores[id] = NewKVStore(c.Nodes[id])
 }
 
@@ -100,7 +77,7 @@ func (c *Cluster) launch(node *Node) {
 
 func (c *Cluster) tick(node *Node) {
 	c.Sim.After(ElectionTick, func() {
-		if node.killed() {
+		if node.dead {
 			return
 		}
 		node.Tick(c.Sim.Now())
@@ -110,5 +87,5 @@ func (c *Cluster) tick(node *Node) {
 
 // Distinct from the transport seed and from every other incarnation of every node.
 func (c *Cluster) nodeSeed(id NodeID) int64 {
-	return c.seed + 1 + int64(id) + int64(c.size)*int64(c.restarts[id])
+	return c.seed + 1 + int64(id) + int64(len(c.Nodes))*int64(c.restarts[id])
 }

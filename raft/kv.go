@@ -60,7 +60,7 @@ func NewKVStore(node *Node) *KVStore {
 		clients: make(map[int64]applied),
 		waiters: make(map[int]waiter),
 	}
-	node.apply = kv.applyMsg
+	node.apply = kv.applyEntry
 	node.save = kv.save
 	node.restore = kv.restore
 	return kv
@@ -68,7 +68,7 @@ func NewKVStore(node *Node) *KVStore {
 
 // Reads go through the log too, so a deposed leader can never answer with stale data.
 func (kv *KVStore) Do(cmd Command, done func(Result, error)) {
-	if kv.node.killed() || kv.node.role != Leader {
+	if kv.node.dead || kv.node.role != Leader {
 		done(Result{}, ErrNotLeader)
 		return
 	}
@@ -79,10 +79,6 @@ func (kv *KVStore) Do(cmd Command, done func(Result, error)) {
 	}
 	kv.waiters[index] = waiter{data, done}
 	kv.node.Submit(data)
-}
-
-func (kv *KVStore) Stop() {
-	kv.failWaiters()
 }
 
 // Callbacks fire in index order; map order would not be deterministic.
@@ -100,25 +96,25 @@ func (kv *KVStore) save() []byte {
 
 func (kv *KVStore) restore(data []byte) {
 	var state kvState
-	if err := json.Unmarshal(data, &state); err != nil {
-		panic(err)
-	}
+	json.Unmarshal(data, &state)
 	kv.data, kv.clients = state.Data, state.Clients
 	kv.failWaiters()
 }
 
 // A different command landing at a waiter's index means leadership changed, so the waiter is failed.
-func (kv *KVStore) applyMsg(msg ApplyMsg) {
+func (kv *KVStore) applyEntry(index int, command []byte) {
 	var res Result
-	if msg.Command != nil {
-		res = kv.apply(decode(msg.Command))
+	if command != nil {
+		var cmd Command
+		json.Unmarshal(command, &cmd)
+		res = kv.apply(cmd)
 	}
-	w, ok := kv.waiters[msg.CommandIndex]
+	w, ok := kv.waiters[index]
 	if !ok {
 		return
 	}
-	delete(kv.waiters, msg.CommandIndex)
-	if bytes.Equal(w.data, msg.Command) {
+	delete(kv.waiters, index)
+	if bytes.Equal(w.data, command) {
 		w.done(res, nil)
 	} else {
 		w.done(Result{}, ErrNotLeader)
@@ -141,12 +137,4 @@ func (kv *KVStore) apply(cmd Command) Result {
 	}
 	kv.clients[cmd.ClientID] = applied{cmd.RequestID, res}
 	return res
-}
-
-func decode(data []byte) Command {
-	var cmd Command
-	if err := json.Unmarshal(data, &cmd); err != nil {
-		panic(err)
-	}
-	return cmd
 }

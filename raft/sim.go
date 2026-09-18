@@ -62,18 +62,6 @@ func (s *Sim) Run(d time.Duration) {
 	s.now = end
 }
 
-func (s *Sim) RunUntil(cond func() bool, limit time.Duration) bool {
-	end := s.now + limit
-	for !cond() {
-		if len(s.queue) == 0 || s.queue[0].at > end {
-			s.now = end
-			return false
-		}
-		s.step()
-	}
-	return true
-}
-
 func (s *Sim) step() {
 	e := heap.Pop(&s.queue).(event)
 	s.now = e.at

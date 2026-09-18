@@ -79,7 +79,7 @@ func (st *SimTransport) live(from, to NodeID) *Node {
 	if st.isPartitioned(from, to) {
 		return nil
 	}
-	if node := st.nodes[to]; node != nil && !node.killed() {
+	if node := st.nodes[to]; node != nil && !node.dead {
 		return node
 	}
 	return nil
